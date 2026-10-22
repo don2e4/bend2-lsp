@@ -353,7 +353,21 @@ function proofImportsLaws(request: AnalysisRequest, sources: Source[]): Analysis
   return [{ uri: request.uri, range: { start: 0, end: 0 }, message: "PROOF.bend must import ./LAWS.bend.", code: "imports" }];
 }
 
+function isBase(file: string): boolean {
+  try { return fs.realpathSync(file) === BASE_BEND; } catch { return false; }
+}
+
+// Base is the prelude, which go-to-definition opens: checked as user code its
+// foreign defs would fail, so it is only described.
+async function describeBase(request: AnalysisRequest): Promise<AnalysisResult> {
+  const book = book_nil();
+  await book_load(book, BASE_BEND, "", new Map());
+  const file: File = { str: "", ns: "", al: Object.create(null) as Record<string, string> };
+  return { id: request.id, uri: request.uri, version: request.version, versions: { [request.uri]: request.version }, diagnostics: [], ...describe(book, file, baseDeclarations()) };
+}
+
 async function analyze(request: AnalysisRequest): Promise<AnalysisResult> {
+  if (isBase(request.path)) return describeBase(request);
   const runRoot = path.join(mirrorRoot, String(request.id));
   try {
     const staged = stageGraph(request.path, request.overlays, runRoot);

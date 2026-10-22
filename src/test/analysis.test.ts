@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import { Analyzer } from "../analysis.js";
 import { lexicalDiagnostics, staticHover } from "../lexical.js";
@@ -208,6 +209,21 @@ test("replaces a worker stuck in a check that never returns", { timeout: 20_000 
     const queued = request("fine.bend", "import Base\n\ndef main() -> U32:\n  0\n");
     assert.match((await stuck).diagnostics[0].message, /Checking stopped after 2 s/);
     assert.deepEqual((await queued).diagnostics, []);
+  } finally {
+    await analyzer.close();
+  }
+});
+
+test("describes the bundled Base without checking it as user code", async () => {
+  const analyzer = new Analyzer();
+  const file = fileURLToPath(new URL("../base.bend", import.meta.url));
+  const uri = pathToFileURL(file).href;
+  const text = fs.readFileSync(file, "utf8");
+  try {
+    const result = await analyzer.analyze({ type: "analyze", uri, path: file, version: 1, text, overlays: [{ uri, path: file, version: 1, text }] });
+    assert.deepEqual(result.diagnostics, []);
+    assert.match(result.hovers["U32.show"], /U32\.show : @a:U32 -> String/);
+    assert.equal(result.definitions["IO.print"].uri, uri);
   } finally {
     await analyzer.close();
   }
