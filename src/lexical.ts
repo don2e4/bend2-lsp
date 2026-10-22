@@ -2,6 +2,12 @@ import type { AnalysisDiagnostic } from "./protocol.js";
 
 type LexicalDiagnostic = Omit<AnalysisDiagnostic, "uri">;
 
+// A hub package (`0x<hash>/` or `<name>@<version>/`) loads from BEND_LIB, not
+// beside the importing file.
+export function hubImport(path: string): boolean {
+  return /^0x[0-9a-f]+\//.test(path) || /^[^/]*@[^/]*\//.test(path);
+}
+
 export function lexicalDiagnostics(source: string): LexicalDiagnostic[] {
   const diagnostics: LexicalDiagnostic[] = [];
   const opens: Array<{ char: string; at: number }> = [];
@@ -51,10 +57,13 @@ const STATIC_HOVERS: Record<string, string> = {
   def: "Declares a top-level function.", type: "Declares an algebraic datatype.", law: "Declares a proposition that must be proved.",
   match: "Pattern-matches one or more values.", case: "Introduces a match case.", do: "Sequences IO operations.", return: "Returns from a `do` block.",
   for: "Introduces a universally quantified law variable.", exs: "Introduces an existential law variable.", where: "Adds a proposition to a law binder.",
-  import: "Imports Base or a namespaced `.bend` file.", Type: "The universe of unrestricted types.", Data: "The universe of affine data.", Kind: "A quantity-indexed type universe.", Quant: "The type of quantities.",
+  import: "Imports Base or a namespaced `.bend` file.", is: "Gives a datatype its kind.",
+  unsafe: "`@unsafe` skips a def's termination check; a proof may not rely on it.", Type: "`Kind(&1)`: types whose values are used at most once, such as functions, arrays and IO handles.", Data: "`Kind(&2)`: types whose values may be reused with `+`.", Kind: "`Kind(q)`: types whose values may be used `q` times.", Quant: "The type of quantities.",
   "->": "Function type or return-type separator.", "=>": "Lambda body separator.", "==": "Propositional equality.", "!=": "Negated equality.", "<&>": "Quantity minimum.",
   "&0": "Erased quantity.", "&1": "Affine quantity.", "&2": "Unrestricted quantity.", "{==}": "Reflexivity proof.", "%": "Equality rewrite.", "!": "Runs a parallel call on the GPU when available.",
 };
+
+export const KEYWORDS = ["def", "type", "law", "match", "case", "do", "return", "for", "exs", "where", "is", "import", "Type", "Data", "Kind", "Quant"];
 
 export function staticHover(token: string): string | null {
   const text = STATIC_HOVERS[token];

@@ -78,6 +78,9 @@ test("serves formatting over an LSP stdio session", async (context) => {
     documentFormattingProvider: true,
     hoverProvider: true,
     definitionProvider: true,
+    completionProvider: { triggerCharacters: ["."] },
+    documentSymbolProvider: true,
+    foldingRangeProvider: true,
   });
 
   send(child, { jsonrpc: "2.0", method: "initialized", params: {} });
@@ -195,5 +198,51 @@ test("navigates imports and clears diagnostics after an imported buffer is fixed
   const shutdown = waitFor(200);
   send(child, { jsonrpc: "2.0", id: 200, method: "shutdown" });
   assert.equal((await shutdown).result, null);
+  send(child, { jsonrpc: "2.0", method: "exit" });
+});
+
+test("completes, outlines and folds over an LSP session", async (context) => {
+  const server = process.env.BEND2_LSP_SERVER ?? fileURLToPath(new URL("../server.js", import.meta.url));
+  const child = spawn(process.execPath, [server, "--stdio"], { stdio: ["pipe", "pipe", "pipe"] });
+  context.after(() => child.kill());
+  const waitFor = responses(child);
+  const dir = path.join(os.tmpdir(), `bend2-lsp-features-${process.pid}`);
+  const mainUri = pathToFileURL(path.join(dir, "main.bend")).href;
+  const depUri = pathToFileURL(path.join(dir, "dep.bend")).href;
+  const mainText = "import Base\nimport ./dep.bend as Dep\n\ndef main() -> U32:\n  Dep.Box.get(Dep.Box{Dep.answer})\n";
+  const depText = "import Base\n\n# A box.\ntype Box is Data:\n  Box{x: U32}\n\ndef Box.get(b: Box) -> U32:\n  match b:\n    case Box{x}:\n      x\n\ndef answer() -> U32:\n  42\n";
+  let id = 1;
+  const call = async (method: string, params: object) => {
+    const response = waitFor(id);
+    send(child, { jsonrpc: "2.0", id, method, params });
+    id++;
+    return (await response).result;
+  };
+
+  await call("initialize", { capabilities: {} });
+  send(child, { jsonrpc: "2.0", method: "initialized", params: {} });
+  send(child, { jsonrpc: "2.0", method: "textDocument/didOpen", params: { textDocument: { uri: depUri, languageId: "bend", version: 1, text: depText } } });
+  send(child, { jsonrpc: "2.0", method: "textDocument/didOpen", params: { textDocument: { uri: mainUri, languageId: "bend", version: 1, text: mainText } } });
+  const hover = async (character: number) => JSON.stringify(await call("textDocument/hover", { textDocument: { uri: mainUri }, position: { line: 4, character } }));
+  let constructor = "null";
+  for (let tries = 0; tries < 40 && constructor === "null"; tries++) {
+    constructor = await hover(16);
+    if (constructor === "null") await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.match(constructor, /constructor Dep\.Box/);
+  assert.match(await hover(6), /def Dep\.Box\.get/);
+
+  const items = await call("textDocument/completion", { textDocument: { uri: mainUri }, position: { line: 4, character: 6 } }) as Array<{ label: string; textEdit: { range: unknown } }>;
+  const answer = items.find((item) => item.label === "Dep.answer");
+  assert.deepEqual(answer?.textEdit.range, { start: { line: 4, character: 2 }, end: { line: 4, character: 6 } });
+  assert.ok(items.some((item) => item.label === "match"));
+
+  const symbols = await call("textDocument/documentSymbol", { textDocument: { uri: depUri } }) as Array<{ name: string; children: Array<{ name: string }> }>;
+  assert.deepEqual(symbols.map((symbol) => [symbol.name, symbol.children.map((child) => child.name)]), [["Box", ["Box"]], ["Box.get", []], ["answer", []]]);
+
+  const folds = await call("textDocument/foldingRange", { textDocument: { uri: depUri } }) as Array<{ startLine: number; endLine: number }>;
+  assert.ok(folds.some((fold) => fold.startLine === 6 && fold.endLine === 9));
+
+  await call("shutdown", {});
   send(child, { jsonrpc: "2.0", method: "exit" });
 });

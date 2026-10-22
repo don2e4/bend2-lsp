@@ -29,7 +29,7 @@ await build({
 });
 await build({
   absWorkingDir: here,
-  entryPoints: [at("src/formatter.ts"), at("src/analysis.ts"), at("src/lexical.ts")],
+  entryPoints: [at("src/formatter.ts"), at("src/analysis.ts"), at("src/lexical.ts"), at("src/outline.ts")],
   outdir: at("dist"),
   platform: "node",
   format: "esm",
@@ -39,7 +39,7 @@ await build({
 });
 await build({
   absWorkingDir: here,
-  entryPoints: [at("src/test/formatter.test.ts"), at("src/test/server.test.ts"), at("src/test/analysis.test.ts")],
+  entryPoints: [at("src/test/formatter.test.ts"), at("src/test/server.test.ts"), at("src/test/analysis.test.ts"), at("src/test/outline.test.ts")],
   outdir: at("dist/test"),
   platform: "node",
   format: "esm",
