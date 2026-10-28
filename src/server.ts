@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-import { existsSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { existsSync, watchFile, unwatchFile } from "node:fs";
+import { isAbsolute, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   CompletionItemKind, createConnection, DiagnosticSeverity, FoldingRangeKind, MarkupKind, ProposedFeatures, SymbolKind, TextDocuments, TextDocumentSyncKind,
@@ -23,6 +23,18 @@ const results = new Map<string, AnalysisResult>();
 // completion still knows the names in scope.
 const lastResults = new Map<string, AnalysisResult>();
 const imports = new Map<string, Set<string>>();
+const analysisDependencies = new Map<string, Set<string>>();
+const watched = new Set<string>();
+let workspaceRoots: string[] = [];
+let proofEntrypoint: string | false | undefined;
+let generation = 0;
+
+function workspaceRoot(file: string): string | undefined {
+  return workspaceRoots.find((root) => {
+    const rest = relative(root, file);
+    return rest === "" || (!isAbsolute(rest) && rest !== ".." && !rest.startsWith(`..${sep}`));
+  });
+}
 
 function supported(document: TextDocument): boolean {
   return document.languageId === "bend" || document.languageId === "bend2";
@@ -52,7 +64,7 @@ function dependentsOf(uri: string): Set<string> {
   let changed = true;
   while (changed) {
     changed = false;
-    for (const [candidate, deps] of imports) {
+    for (const [candidate, deps] of [...imports, ...analysisDependencies]) {
       if (![...deps].some((dep) => result.has(dep)) || result.has(candidate)) continue;
       result.add(candidate);
       changed = true;
@@ -84,7 +96,34 @@ function targets(result: AnalysisResult): Set<string> {
 }
 
 function fresh(result: AnalysisResult): boolean {
-  return Object.entries(result.versions).every(([uri, version]) => documents.get(uri)?.version === version);
+  return Object.entries(result.versions).every(([uri, version]) => documents.get(uri)?.version === version) &&
+    (result.dependencies ?? []).every((uri) => documents.get(uri)?.version === result.versions[uri]);
+}
+
+// Watch only files used by open analyses. This also handles proof files that
+// are never opened in the editor, and creation/deletion of PROOF.bend.
+function watchDependencies(): void {
+  const wanted = new Set([...analysisDependencies.values()].flatMap((items) => [...items]));
+  for (const uri of watched) if (!wanted.has(uri)) {
+    unwatchFile(filePath(uri)!);
+    watched.delete(uri);
+  }
+  for (const uri of wanted) {
+    const file = filePath(uri);
+    if (!file || watched.has(uri)) continue;
+    watched.add(uri);
+    watchFile(file, { persistent: false, interval: 750 }, (current, previous) => {
+      if (current.mtimeMs === previous.mtimeMs && current.size === previous.size && current.ino === previous.ino) return;
+      if (!documents.get(uri)) changed(uri);
+    });
+  }
+}
+
+function changed(uri: string, delay = 250): void {
+  generation++;
+  const affected = dependentsOf(uri);
+  invalidate(affected);
+  for (const candidate of affected) if (documents.get(candidate)) schedule(candidate, delay);
 }
 
 function publish(uri: string): void {
@@ -94,8 +133,10 @@ function publish(uri: string): void {
   const lexicalPositions = new Set(lex.map((item) => `${item.code}:${item.range.start.line}:${item.range.start.character}`));
   const seen = new Set<string>();
   const compiler: Diagnostic[] = [];
-  for (const result of results.values()) {
-    if (!fresh(result)) continue;
+  // Every open file has its own selected compilation context. Unioning other
+  // roots' results can resurrect an "unproved" law that this context proves.
+  const result = results.get(uri);
+  if (result && fresh(result)) {
     for (const item of result.diagnostics) {
       if (item.uri !== uri) continue;
       const converted = diagnostic(document, item);
@@ -126,10 +167,14 @@ async function analyze(uri: string): Promise<void> {
     publish(uri);
     return;
   }
-  const result = await analyzer.analyze({ type: "analyze", uri, path, version, text: document.getText(), overlays: overlays() });
+  const started = generation;
+  const result = await analyzer.analyze({ type: "analyze", uri, path, version, text: document.getText(), overlays: overlays(), workspaceRoot: workspaceRoot(path), proofEntrypoint });
   const current = documents.get(uri);
-  if (current) lastResults.set(uri, result);
-  if (!current || current.version !== result.version || !fresh(result)) return;
+  if (!current) return;
+  if (started !== generation || current.version !== result.version || !fresh(result)) { schedule(uri); return; }
+  lastResults.set(uri, result);
+  analysisDependencies.set(uri, new Set(result.dependencies ?? []));
+  watchDependencies();
   const old = results.get(uri);
   results.set(uri, result);
   const affected = targets(result);
@@ -146,13 +191,19 @@ function schedule(uri: string, delay = 250): void {
   }, delay));
 }
 
-connection.onInitialize((): InitializeResult => ({
-  capabilities: {
-    textDocumentSync: TextDocumentSyncKind.Full, documentFormattingProvider: true, hoverProvider: true, definitionProvider: true,
-    completionProvider: { triggerCharacters: ["."] }, documentSymbolProvider: true, foldingRangeProvider: true,
-  },
-  serverInfo: { name: "bend2-lsp", version: VERSION },
-}));
+connection.onInitialize((params): InitializeResult => {
+  workspaceRoots = (params.workspaceFolders?.length ? params.workspaceFolders.map((folder) => filePath(folder.uri)) : [params.rootUri ? filePath(params.rootUri) : params.rootPath])
+    .filter((root): root is string => typeof root === "string").sort((a, b) => b.length - a.length);
+  const entry: unknown = params.initializationOptions?.proofEntrypoint;
+  proofEntrypoint = entry === false || (typeof entry === "string" && entry.trim() !== "") ? entry : undefined;
+  return {
+    capabilities: {
+      textDocumentSync: TextDocumentSyncKind.Full, documentFormattingProvider: true, hoverProvider: true, definitionProvider: true,
+      completionProvider: { triggerCharacters: ["."] }, documentSymbolProvider: true, foldingRangeProvider: true,
+    },
+    serverInfo: { name: "bend2-lsp", version: VERSION },
+  };
+});
 
 connection.onDocumentFormatting((params): TextEdit[] => {
   const document = documents.get(params.textDocument.uri);
@@ -289,18 +340,15 @@ connection.onFoldingRanges((params): FoldingRange[] => {
 documents.onDidOpen(({ document }) => {
   if (!supported(document)) return;
   imports.set(document.uri, importUris(document));
-  const affected = dependentsOf(document.uri);
-  invalidate(affected);
-  for (const uri of affected) schedule(uri, 0);
+  changed(document.uri, 0);
 });
 documents.onDidChangeContent(({ document }) => {
   if (!supported(document)) return;
   imports.set(document.uri, importUris(document));
-  const affected = dependentsOf(document.uri);
-  invalidate(affected);
-  for (const uri of affected) schedule(uri);
+  changed(document.uri);
 });
 documents.onDidClose(({ document }) => {
+  generation++;
   const timer = timers.get(document.uri);
   if (timer) clearTimeout(timer);
   timers.delete(document.uri);
@@ -308,10 +356,18 @@ documents.onDidClose(({ document }) => {
   lastResults.delete(document.uri);
   const affected = dependentsOf(document.uri);
   invalidate(affected);
+  analysisDependencies.delete(document.uri);
+  watchDependencies();
   connection.sendDiagnostics({ uri: document.uri, diagnostics: [] });
   for (const uri of affected) if (uri !== document.uri) schedule(uri);
 });
 
-connection.onShutdown(async () => { await analyzer.close(); });
+connection.onDidChangeWatchedFiles(({ changes }) => {
+  for (const change of changes) if (!documents.get(change.uri)) changed(change.uri);
+});
+connection.onShutdown(async () => {
+  for (const uri of watched) unwatchFile(filePath(uri)!);
+  await analyzer.close();
+});
 documents.listen(connection);
 connection.listen();
