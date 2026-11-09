@@ -75,7 +75,54 @@ function namespaceOf(top: string, file: string): string {
   return path.relative(top, file).replaceAll("\\", "/").replace(/\.bend$/, "");
 }
 
-function stageGraph(root: string, overlays: Overlay[], runRoot: string): { entry: string; sources: Source[] } {
+// Select a compilation entry, never join unrelated files merely because they
+// are open. The conventional entry must actually import the edited document.
+function proofContext(request: AnalysisRequest): { entry: string; dependencies: Set<string>; error?: string } {
+  const dependencies = new Set<string>();
+  const overlay = new Map(request.overlays.map((item) => [key(item.path), item.text]));
+  const read = (file: string): string | undefined => {
+    dependencies.add(pathToFileURL(file).href);
+    const text = overlay.get(key(file));
+    if (text !== undefined) return text;
+    return fs.existsSync(file) ? fs.readFileSync(file, "utf8") : undefined;
+  };
+  const contains = (entry: string): boolean => {
+    const seen = new Set<string>();
+    const visit = (file: string): boolean => {
+      const id = key(file);
+      if (seen.has(id)) return false;
+      seen.add(id);
+      if (id === key(request.path)) return true;
+      const text = read(file);
+      return text !== undefined && imports(text).some((item) =>
+        !hubImport(item.relative) && !path.isAbsolute(item.relative) &&
+        visit(path.resolve(path.dirname(file), item.relative)));
+    };
+    return visit(entry);
+  };
+  if (request.proofEntrypoint === false) return { entry: request.path, dependencies };
+  if (typeof request.proofEntrypoint === "string") {
+    const entry = path.resolve(request.workspaceRoot ?? path.dirname(request.path), request.proofEntrypoint);
+    if (read(entry) === undefined) return { entry: request.path, dependencies, error: `Proof entrypoint does not exist: ${entry}` };
+    return { entry: contains(entry) ? entry : request.path, dependencies };
+  }
+  let directory = path.dirname(request.path);
+  const boundary = path.resolve(request.workspaceRoot ?? directory);
+  const within = (dir: string) => {
+    const relative = path.relative(boundary, dir);
+    return relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
+  };
+  while (true) {
+    const entry = path.join(directory, "PROOF.bend");
+    if (contains(entry)) return { entry, dependencies };
+    const parent = path.dirname(directory);
+    if (directory === boundary || parent === directory || !within(parent)) break;
+    directory = parent;
+  }
+  return { entry: request.path, dependencies };
+}
+
+function stageGraph(root: string, overlays: Overlay[], runRoot: string, dependencies: Set<string>): { entry: string; sources: Source[] } {
   const overlay = new Map(overlays.map((item) => [key(item.path), item]));
   const top = path.dirname(root);
   const sources: Source[] = [];
@@ -84,6 +131,7 @@ function stageGraph(root: string, overlays: Overlay[], runRoot: string): { entry
     const id = key(file);
     if (seen.has(id)) return;
     seen.add(id);
+    dependencies.add(pathToFileURL(file).href);
     const open = overlay.get(id);
     if (!open && !fs.existsSync(file)) return;
     const text = open?.text ?? fs.readFileSync(file, "utf8");
@@ -191,25 +239,27 @@ function describe(book: Book, file: File, declared: Declared[]): Pick<AnalysisRe
   const hovers: Record<string, string> = Object.create(null) as Record<string, string>;
   const definitions: Record<string, Location> = Object.create(null) as Record<string, Location>;
   const completions: CompletionEntry[] = [];
-  const named = new Set(["", ...Object.values(file.al)]);
-  const nameable = (key: string) => named.has(key.includes(":") ? key.slice(0, key.indexOf(":")) : "");
+  const named = new Set([file.ns, ...Object.values(file.al)]);
+  const nameable = (key: string, declaration?: Declared) =>
+    named.has(key.includes(":") ? key.slice(0, key.indexOf(":")) : "") ||
+    declaration?.source.original === BASE_BEND;
   const tlds = index(declared, false);
   const ctrs = index(declared, true);
   for (const [name, tld] of Object.entries(book.tlds)) {
-    if (!nameable(name)) continue;
+    const declaration = tlds.get(name);
+    if (!nameable(name, declaration)) continue;
     const shown = name_show(file, name);
     const kind = tld.$ === "ADT" ? "type" : tld.l ? "law" : "def";
     const signature = term_show(term_lower(tld.T), -1, [], file);
-    const declaration = tlds.get(name);
     hovers[shown] = hoverText(kind, shown, signature, declaration?.doc ?? "");
     if (declaration) definitions[shown] = location(declaration);
     completions.push({ label: shown, kind, detail: signature, documentation: declaration?.doc || undefined });
   }
   for (const [name, constructor] of Object.entries(book.ctrs)) {
-    if (!nameable(name)) continue;
+    const declaration = ctrs.get(name);
+    if (!nameable(name, declaration)) continue;
     const shown = name_show(file, name);
     const signature = term_show(term_lower(constructor.T), -1, [], file);
-    const declaration = ctrs.get(name);
     const hover = hoverText("constructor", shown, signature, declaration?.doc ?? "");
     hovers[`${shown}{}`] = hover;
     if (!(shown in hovers)) hovers[shown] = hover;
@@ -370,18 +420,24 @@ async function analyze(request: AnalysisRequest): Promise<AnalysisResult> {
   if (isBase(request.path)) return describeBase(request);
   const runRoot = path.join(mirrorRoot, String(request.id));
   try {
-    const staged = stageGraph(request.path, request.overlays, runRoot);
+    const context = proofContext(request);
+    const staged = stageGraph(context.entry, request.overlays, runRoot, context.dependencies);
     const root = staged.sources[0];
-    const file: File = { str: "", ns: "", al: Object.assign(Object.create(null) as Record<string, string>, Object.fromEntries(root.aliases)) };
+    const current = staged.sources.find((source) => key(source.original) === key(request.path))!;
+    const view = (source: Source): File => ({ str: "", ns: source.namespace, al: Object.assign(Object.create(null) as Record<string, string>, Object.fromEntries(source.aliases)) });
+    const file = view(current);
     const declared = [...declare(staged.sources), ...baseDeclarations()];
     const book = book_nil();
     let checking = false;
     const diagnostics: AnalysisDiagnostic[] = [];
     try {
-      const done = await book_load(book, compilerPath(staged.entry), "", new Map());
+      await book_load(book, compilerPath(staged.entry), "", new Map());
       checking = true;
-      book_valid(book, done);
-      diagnostics.push(...markers(book, staged.sources, declared), ...verdict(book, file, staged.sources, declared));
+      // book_load returns the number of imported declarations, not the number
+      // already checked. Skipping them misses unfilled laws and invalid proofs
+      // in imports. Like the CLI without a prechecked Base, check the full book.
+      book_valid(book);
+      diagnostics.push(...markers(book, staged.sources, declared), ...verdict(book, view(root), staged.sources, declared));
     } catch (caught) {
       const error = caught as Partial<Err>;
       if (error.$ === "Err" && error.bok && error.ctx && error.exp !== undefined) {
@@ -401,9 +457,19 @@ async function analyze(request: AnalysisRequest): Promise<AnalysisResult> {
         diagnostics.push({ uri: request.uri, range: { start: 0, end: 0 }, message: caught instanceof Error ? caught.message : String(caught), code: checking ? "checking" : "imports" });
       }
     }
-    diagnostics.push(...proofImportsLaws(request, staged.sources));
+    diagnostics.push(...proofImportsLaws({ ...request, path: context.entry, uri: root.uri }, staged.sources));
+    if (context.error) diagnostics.push({ uri: request.uri, range: { start: 0, end: 0 }, message: context.error, code: "proof-context" });
+    // Errors in a closed proof file must not make the viewed laws look clean.
+    const external = diagnostics.find((item) => item.uri !== request.uri && item.severity !== "warning")
+      ?? diagnostics.find((item) => item.uri !== request.uri);
+    if (external) {
+      diagnostics.push({ uri: request.uri, range: { start: 0, end: 0 }, code: "proof-context", severity: external.severity,
+        message: `Checking ${context.entry} reports a diagnostic in ${external.uri}: ${external.message}` });
+    }
     const versions = Object.fromEntries(staged.sources.flatMap((source) => source.version === undefined ? [] : [[source.uri, source.version]]));
-    return { id: request.id, uri: request.uri, version: request.version, versions, diagnostics, ...describe(book, file, declared) };
+    // Discovery reads overlays too, including an entry whose import was removed.
+    for (const overlay of request.overlays) if (context.dependencies.has(overlay.uri)) versions[overlay.uri] = overlay.version;
+    return { id: request.id, uri: request.uri, version: request.version, versions, dependencies: [...context.dependencies], entrypoint: root.uri, diagnostics, ...describe(book, file, declared) };
   } finally {
     fs.rmSync(runRoot, { recursive: true, force: true });
   }

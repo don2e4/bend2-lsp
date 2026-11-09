@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as fs from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 
 type Message = { id?: number; method?: string; params?: unknown; result?: unknown; error?: unknown };
-type WaitFor = ((id: number) => Promise<Message>) & { notification(method: string): Promise<Message> };
+type Published = { uri: string; version?: number; diagnostics: Array<{ code?: string; message: string }> };
+type WaitFor = ((id: number) => Promise<Message>) & { notification(method: string): Promise<Message>; diagnostics: Map<string, Published> };
 
 function send(child: ChildProcessWithoutNullStreams, message: object): void {
   const body = JSON.stringify(message);
@@ -19,6 +21,7 @@ function responses(child: ChildProcessWithoutNullStreams): WaitFor {
   const pending = new Map<number, { resolve: (message: Message) => void; reject: (error: Error) => void }>();
   const notificationPending = new Map<string, { resolve: (message: Message) => void; reject: (error: Error) => void }>();
   const notificationQueued = new Map<string, Message[]>();
+  const diagnostics = new Map<string, Published>();
   child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
   child.on("exit", (code) => {
     const error = new Error(`server exited (${code}): ${stderr.trim()}`);
@@ -38,6 +41,10 @@ function responses(child: ChildProcessWithoutNullStreams): WaitFor {
       buffer = buffer.subarray(marker + 4 + length);
       if (message.id !== undefined) pending.get(message.id)?.resolve(message);
       else if (message.method) {
+        if (message.method === "textDocument/publishDiagnostics") {
+          const published = message.params as Published;
+          diagnostics.set(published.uri, published);
+        }
         const waiter = notificationPending.get(message.method);
         if (waiter) {
           notificationPending.delete(message.method);
@@ -60,8 +67,84 @@ function responses(child: ChildProcessWithoutNullStreams): WaitFor {
     const timer = setTimeout(() => reject(new Error(`timed out waiting for ${method}`)), 5000);
     notificationPending.set(method, { resolve: (message) => { clearTimeout(timer); resolve(message); }, reject: (error) => { clearTimeout(timer); reject(error); } });
   });
+  waitFor.diagnostics = diagnostics;
   return waitFor;
 }
+
+test("refreshes contextual diagnostics for closed files and unsaved proof edits", async (context) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bend2-context-session-"));
+  const lawPath = path.join(dir, "LAWS.bend");
+  const proofPath = path.join(dir, "PROOF.bend");
+  const lawUri = pathToFileURL(lawPath).href;
+  const proofUri = pathToFileURL(proofPath).href;
+  const laws = "import Base\n\nlaw same:\n  {0 == 0 : U32}\n";
+  const missing = "import ./LAWS.bend as L\n";
+  const good = missing + "\ndef L.same(): {==}\n";
+  const broken = missing + "\ndef L.same(): 42\n";
+  fs.writeFileSync(lawPath, laws);
+  fs.writeFileSync(proofPath, good);
+  const server = process.env.BEND2_LSP_SERVER ?? fileURLToPath(new URL("../server.js", import.meta.url));
+  const child = spawn(process.execPath, [server, "--stdio"], { stdio: ["pipe", "pipe", "pipe"] });
+  context.after(() => { child.kill(); fs.rmSync(dir, { recursive: true, force: true }); });
+  const waitFor = responses(child);
+  let id = 1;
+  const call = async (method: string, params: object) => {
+    const reply = waitFor(id);
+    send(child, { jsonrpc: "2.0", id: id++, method, params });
+    const message = await reply;
+    assert.equal(message.error, undefined);
+    return message.result;
+  };
+  const until = async (predicate: () => boolean | Promise<boolean>) => {
+    for (let tries = 0; tries < 200; tries++) {
+      if (await predicate()) return;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.fail(`timed out: ${JSON.stringify([...waitFor.diagnostics])}`);
+  };
+  const has = (uri: string, code: string) => !!waitFor.diagnostics.get(uri)?.diagnostics.some((item) => item.code === code);
+  const checked = async () => {
+    await until(async () => !!await call("textDocument/hover", { textDocument: { uri: lawUri }, position: { line: 2, character: 5 } }));
+    assert.deepEqual(waitFor.diagnostics.get(lawUri)?.diagnostics, []);
+  };
+  await call("initialize", { rootUri: pathToFileURL(dir).href, capabilities: {} });
+  send(child, { jsonrpc: "2.0", method: "initialized", params: {} });
+  send(child, { jsonrpc: "2.0", method: "textDocument/didOpen", params: { textDocument: { uri: lawUri, languageId: "bend", version: 1, text: laws } } });
+  await checked();
+
+  // This independent root imports the laws but not their proofs. Its standalone
+  // incomplete-law diagnostics must not contaminate the laws' proof context.
+  const scratchUri = pathToFileURL(path.join(dir, "scratch.bend")).href;
+  const scratch = "import ./LAWS.bend as L\n\ndef helper() -> U32:\n  0\n";
+  send(child, { jsonrpc: "2.0", method: "textDocument/didOpen", params: { textDocument: { uri: scratchUri, languageId: "bend", version: 1, text: scratch } } });
+  await until(async () => !!await call("textDocument/hover", { textDocument: { uri: scratchUri }, position: { line: 2, character: 5 } }));
+  assert.deepEqual(waitFor.diagnostics.get(lawUri)?.diagnostics, []);
+  send(child, { jsonrpc: "2.0", method: "textDocument/didClose", params: { textDocument: { uri: scratchUri } } });
+
+  // Proof stays closed: a disk edit must invalidate and recheck the laws.
+  fs.writeFileSync(proofPath, missing);
+  await until(() => has(lawUri, "incomplete-law"));
+  fs.writeFileSync(proofPath, broken);
+  await until(() => has(lawUri, "proof-context") && !has(lawUri, "incomplete-law"));
+
+  // Opening an unsaved repaired proof overrides its broken on-disk version.
+  send(child, { jsonrpc: "2.0", method: "textDocument/didOpen", params: { textDocument: { uri: proofUri, languageId: "bend", version: 1, text: good } } });
+  await checked();
+  send(child, { jsonrpc: "2.0", method: "textDocument/didChange", params: { textDocument: { uri: proofUri, version: 2 }, contentChanges: [{ text: missing }] } });
+  await until(() => has(lawUri, "incomplete-law"));
+  send(child, { jsonrpc: "2.0", method: "textDocument/didChange", params: { textDocument: { uri: proofUri, version: 3 }, contentChanges: [{ text: good }] } });
+  await checked();
+  send(child, { jsonrpc: "2.0", method: "textDocument/didClose", params: { textDocument: { uri: proofUri } } });
+  await until(() => has(lawUri, "proof-context"));
+  fs.unlinkSync(proofPath);
+  await until(() => has(lawUri, "incomplete-law"));
+  fs.writeFileSync(proofPath, good);
+  // Wait for the watcher to invalidate the missing-proof result first.
+  await until(() => !has(lawUri, "incomplete-law"));
+  await checked();
+  assert.equal(await call("shutdown", {}), null);
+  send(child, { jsonrpc: "2.0", method: "exit" });
+});
 
 test("serves formatting over an LSP stdio session", async (context) => {
   const server = process.env.BEND2_LSP_SERVER ?? fileURLToPath(new URL("../server.js", import.meta.url));

@@ -6,6 +6,81 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import { Analyzer } from "../analysis.js";
 import { lexicalDiagnostics, staticHover } from "../lexical.js";
+import type { AnalysisRequest } from "../protocol.js";
+
+test("checks a law through its proof entrypoint and retains the law file's scope", async (context) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bend2-proof-context-"));
+  const analyzer = new Analyzer();
+  context.after(async () => { await analyzer.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+  const laws = "import Base\n\nlaw same:\n  {0 == 0 : U32}\n";
+  const proof = "import ./LAWS.bend as L\n\ndef L.same():\n  {==}\n\ndef private_helper() -> U32:\n  42\n";
+  const file = path.join(dir, "LAWS.bend");
+  const entry = path.join(dir, "PROOF.bend");
+  const uri = pathToFileURL(file).href;
+  fs.writeFileSync(file, laws);
+  fs.writeFileSync(entry, proof);
+  const input = { type: "analyze" as const, path: file, uri, text: laws, version: 1, overlays: [{ path: file, uri, text: laws, version: 1 }], workspaceRoot: dir };
+  const result = await analyzer.analyze(input);
+  assert.deepEqual(result.diagnostics, []);
+  assert.equal(result.entrypoint, pathToFileURL(entry).href);
+  assert.match(result.hovers.same, /same :/);
+  assert.equal(result.definitions.same.uri, uri);
+  assert.ok(result.completions.some((item) => item.label === "same"));
+  assert.ok(result.completions.some((item) => item.label === "U32"));
+  assert.equal(result.hovers.private_helper, undefined);
+  assert.ok(!result.completions.some((item) => item.label.startsWith("L.")));
+  assert.ok(result.dependencies?.includes(pathToFileURL(entry).href));
+
+  // Proof bodies may themselves live in an imported module. They must be
+  // checked, not trusted merely because the entry imports their definitions.
+  const pieces = path.join(dir, "pieces.bend");
+  fs.writeFileSync(entry, "import ./pieces.bend as Pieces\n");
+  fs.writeFileSync(pieces, "import Base\nimport ./LAWS.bend as L\n\ndef L.same(): Unit{}\n");
+  const invalidImport = await analyzer.analyze(input);
+  assert.ok(invalidImport.diagnostics.some((item) => item.code === "checking"));
+  assert.ok(invalidImport.diagnostics.some((item) => item.uri === uri && item.code === "proof-context"));
+  fs.writeFileSync(pieces, proof);
+  assert.deepEqual((await analyzer.analyze(input)).diagnostics, []);
+  fs.writeFileSync(entry, proof);
+
+  for (const [body, code] of [["", "incomplete-law"], ["def L.same(): Unit{}", "checking"], ["def L.same(): ?TODO", "holes"], ["@unsafe def L.same(): {==}", "verdict"]]) {
+    const text = `import Base\nimport ./LAWS.bend as L\n\n${body}\n`;
+    const overlay = { path: entry, uri: pathToFileURL(entry).href, text, version: 2 };
+    const failed = await analyzer.analyze({ ...input, overlays: [...input.overlays, overlay] });
+    assert.ok(failed.diagnostics.some((item) => item.code === code), `${code}: ${JSON.stringify(failed.diagnostics)}`);
+    if (code !== "incomplete-law") assert.ok(failed.diagnostics.some((item) => item.uri === uri && item.code === "proof-context"));
+    assert.equal(failed.versions[overlay.uri], 2);
+  }
+  // Reverting to the on-disk proof clears all failure modes.
+  assert.deepEqual((await analyzer.analyze(input)).diagnostics, []);
+  fs.unlinkSync(entry);
+  assert.equal((await analyzer.analyze(input)).diagnostics[0]?.code, "incomplete-law");
+});
+
+test("discovers ancestor proofs, supports custom entries and respects project boundaries", async (context) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bend2-proof-discovery-"));
+  const analyzer = new Analyzer();
+  context.after(async () => { await analyzer.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+  fs.mkdirSync(path.join(dir, "specs"));
+  const file = path.join(dir, "specs", "claims.bend");
+  const uri = pathToFileURL(file).href;
+  const text = "import Base\n\nlaw same:\n  {0 == 0 : U32}\n";
+  fs.writeFileSync(file, text);
+  fs.writeFileSync(path.join(dir, "bridge.bend"), "import ./specs/claims.bend as Claims\n");
+  fs.writeFileSync(path.join(dir, "PROOF.bend"), "import ./bridge.bend as B\nimport ./specs/claims.bend as C\n\ndef C.same(): {==}\n");
+  const input: Omit<AnalysisRequest, "id"> = { type: "analyze", path: file, uri, text, version: 1, overlays: [{ path: file, uri, text, version: 1 }], workspaceRoot: dir };
+  assert.deepEqual((await analyzer.analyze(input)).diagnostics, []);
+  assert.equal((await analyzer.analyze({ ...input, workspaceRoot: path.dirname(file) })).diagnostics[0]?.code, "incomplete-law");
+  assert.equal((await analyzer.analyze({ ...input, proofEntrypoint: false })).diagnostics[0]?.code, "incomplete-law");
+  fs.renameSync(path.join(dir, "PROOF.bend"), path.join(dir, "verify.bend"));
+  assert.deepEqual((await analyzer.analyze({ ...input, proofEntrypoint: "verify.bend" })).diagnostics, []);
+  assert.ok((await analyzer.analyze({ ...input, proofEntrypoint: "missing.bend" })).diagnostics.some((item) => item.code === "proof-context"));
+  // Merely opening an unrelated proof must never certify this law.
+  fs.writeFileSync(path.join(dir, "PROOF.bend"), "import Base\n\nlaw same:\n  {0 == 0 : U32}\ndef same(): {==}\n");
+  const unrelated = await analyzer.analyze(input);
+  assert.equal(unrelated.diagnostics[0]?.code, "incomplete-law");
+  assert.equal(unrelated.entrypoint, uri);
+});
 
 test("reports lexical errors and documents syntax", () => {
   const diagnostics = lexicalDiagnostics('def main() -> String:\n  "unfinished\n  ?TODO');

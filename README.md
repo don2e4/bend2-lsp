@@ -45,6 +45,40 @@ each line ending, and final-newline state. It normalizes indentation and safe
 token spacing without wrapping code, and keeps lines pinned to a body's column
 where Bend's layout depends on it.
 
+## Proof entrypoints
+
+The server checks the closest `PROOF.bend` in the document's directory or an
+ancestor directory, stopping at the LSP workspace root. That entrypoint must
+transitively import the document through local imports. Otherwise the document
+is checked on its own. Without a workspace root, only its directory is searched.
+This supports separate law and proof modules without treating open files as
+implicit imports. All declarations in the selected import graph are checked.
+
+For another layout, pass `initializationOptions.proofEntrypoint` as a path
+relative to the workspace root (an absolute path also works). For example,
+Neovim's server setup accepts:
+
+```lua
+init_options = { proofEntrypoint = 'proofs/verify.bend' },
+```
+
+Set `proofEntrypoint = false` to disable discovery. A missing explicit entry
+is an error. Files outside that entry's import graph are still checked on their
+own. There is one selected context per document; separate proof suites are not
+merged. An explicit setting selects the intended suite for shared modules.
+Restart the server after changing this option.
+
+Unsaved buffers override disk contents throughout the graph. Opening, editing,
+or closing a dependency rechecks affected buffers. Closed dependencies and
+conventional entrypoint candidates are watched for disk changes (750 ms polling,
+plus the normal edit debounce). This includes creating or deleting a proof file.
+Diagnostics keep their original locations; an open document also gets a summary
+when its proof context has errors elsewhere, including in a closed file.
+Hover, completion and navigation remain scoped to the file being edited.
+
+These editor checks use the bundled checker. They do not run the independent
+`--verdict` kernel; continue using the project's proof command for that check.
+
 ## Editor setup
 
 VS Code:

@@ -5,7 +5,7 @@ export type AnalysisDiagnostic = {
   uri: string;
   range: OffsetRange;
   message: string;
-  code: "parsing" | "checking" | "imports" | "incomplete-law" | "holes" | "verdict";
+  code: "parsing" | "checking" | "imports" | "incomplete-law" | "holes" | "verdict" | "proof-context";
   severity?: "error" | "warning";
 };
 
@@ -18,6 +18,9 @@ export type AnalysisResult = {
   uri: string;
   version: number;
   versions: Record<string, number>;
+  // Includes closed files and missing conventional entrypoint candidates.
+  dependencies?: string[];
+  entrypoint?: string;
   diagnostics: AnalysisDiagnostic[];
   hovers: Record<string, string>;
   definitions: Record<string, Location>;
@@ -33,4 +36,7 @@ export type AnalysisRequest = {
   version: number;
   text: string;
   overlays: Overlay[];
+  workspaceRoot?: string;
+  // Relative to workspaceRoot. false opts out of conventional discovery.
+  proofEntrypoint?: string | false;
 };
