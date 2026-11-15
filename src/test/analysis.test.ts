@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import { Analyzer } from "../analysis.js";
 import { lexicalDiagnostics, staticHover } from "../lexical.js";
-import type { AnalysisRequest } from "../protocol.js";
+import type { AnalysisRequest, Location } from "../protocol.js";
 
 test("checks a law through its proof entrypoint and retains the law file's scope", async (context) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bend2-proof-context-"));
@@ -302,4 +302,61 @@ test("describes the bundled Base without checking it as user code", async () => 
   } finally {
     await analyzer.close();
   }
+});
+
+test("finds references through the compiler's scopes", async () => {
+  const files: Record<string, string> = {
+    "main.bend": [
+      "import Base",
+      "import ./dep.bend as Dep",
+      "",
+      "def twice(answer: U32) -> U32:",
+      "  (answer + Dep.answer : U32)",
+      "",
+      "def open(b: Dep.Box, xs: +List<Dep.Box>) -> String:",
+      "  match b:",
+      "    case Dep.Box{x}:",
+      '      U32.show(twice(x)) # Dep.answer "Dep.Box{"',
+      "",
+      "def Dep.same(b):",
+      "  {==}",
+      "",
+    ].join("\n"),
+    "dep.bend": "import Base\n\ntype Box is Data:\n  Box{x: U32}\n\ndef answer() -> U32:\n  42\n\nlaw same:\n  for b: Box\n  {b == b : Box}\n",
+  };
+  const result = await analyzeFiles("references", files);
+  assert.deepEqual(result.diagnostics, []);
+  // A place as its line with the range in brackets.
+  const shown = (item: Location) => {
+    const file = path.basename(fileURLToPath(item.uri));
+    const line = (files[file] ?? "").split("\n")[item.range.start.line] ?? "";
+    return `${file}:${line.slice(0, item.range.start.character)}[${line.slice(item.range.start.character, item.range.end.character)}]${line.slice(item.range.end.character)}`;
+  };
+  const group = (declaration: string) => {
+    const found = result.references.filter((item) => item.declarations.some((place) => shown(place) === declaration));
+    assert.equal(found.length, 1, declaration);
+    return { declarations: found[0].declarations.map(shown).sort(), uses: found[0].uses.map(shown).sort(), renameable: found[0].renameable };
+  };
+  // The parameter that shadows `answer`, the comment and the string are not uses.
+  assert.deepEqual(group("dep.bend:def [answer]() -> U32:"), {
+    declarations: ["dep.bend:def [answer]() -> U32:"], uses: ["main.bend:  (answer + Dep.[answer] : U32)"], renameable: true,
+  });
+  assert.deepEqual(group("dep.bend:type [Box] is Data:").uses, [
+    "dep.bend:  for b: [Box]", "dep.bend:  {b == b : [Box]}",
+    "main.bend:def open(b: Dep.Box, xs: +List<Dep.[Box]>) -> String:", "main.bend:def open(b: Dep.[Box], xs: +List<Dep.Box>) -> String:",
+  ]);
+  assert.deepEqual(group("dep.bend:  [Box]{x: U32}").uses, ["main.bend:    case Dep.[Box]{x}:"]);
+  assert.deepEqual(group("dep.bend:law [same]:").declarations, ["dep.bend:law [same]:", "main.bend:def Dep.[same](b):"]);
+  assert.deepEqual(group("main.bend:def [twice](answer: U32) -> U32:").uses, ['main.bend:      U32.show([twice](x)) # Dep.answer "Dep.Box{"']);
+  const base = result.references.find((item) => item.uses.some((place) => shown(place).includes("[U32.show]")));
+  assert.equal(base?.renameable, false);
+  assert.match(base?.declarations[0]?.uri ?? "", /\/base\.bend$/);
+  const list = result.references.find((item) => item.uses.some((place) => shown(place).includes("+[List]<")));
+  assert.equal(list?.renameable, false);
+
+  const broken = await analyzeFiles("references-broken", { "main.bend": "import Base\n\ndef main() -> U32:\n  )\n" });
+  assert.deepEqual(broken.references, []);
+  const mistyped = await analyzeFiles("references-mistyped", { "main.bend": 'import Base\n\ndef text() -> U32:\n  "no"\n\ndef main() -> U32:\n  text\n' });
+  assert.equal(mistyped.diagnostics[0]?.code, "checking");
+  assert.equal(mistyped.references.find((item) => item.renameable && item.uses.length === 1)?.uses[0].range.start.line, 6);
 });

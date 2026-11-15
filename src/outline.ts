@@ -45,6 +45,35 @@ function stripComment(line: string): string {
   return line;
 }
 
+// The text with comments and literals turned to spaces, offsets kept, so a
+// scan for code cannot match inside them.
+export function codeOnly(text: string): string {
+  let out = "";
+  let quote = "";
+  let escaped = false;
+  let comment = false;
+  for (const char of text.split("")) {
+    if (char === "\n") {
+      quote = "";
+      escaped = comment = false;
+      out += char;
+    } else if (comment) out += " ";
+    else if (quote) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === quote) quote = "";
+      out += " ";
+    } else if (char === "#") {
+      comment = true;
+      out += " ";
+    } else if (char === '"' || char === "'") {
+      quote = char;
+      out += " ";
+    } else out += char;
+  }
+  return out;
+}
+
 function indent(line: Line): number {
   return line.text.length - line.text.trimStart().length;
 }

@@ -1,8 +1,8 @@
 # Bend 2 language server
 
 `bend2-lsp` provides formatting, live compiler diagnostics, Markdown hover,
-go-to-definition, completion, document symbols, and folding for Bend 2 over
-LSP stdio. Node.js 26.9 or newer is required.
+go-to-definition, find references, rename, completion, document symbols, and
+folding for Bend 2 over LSP stdio. Node.js 26.9 or newer is required.
 
 ```sh
 npm install -g bend2-lsp
@@ -31,6 +31,17 @@ paths and aliases, and names declared in the file, its relative imports, and
 Base (which opens the bundled `base.bend`). Completion offers keywords and every
 name in scope from the last analysis, including alias-qualified names after
 `.`. Document symbols list types with their constructors, defs, and laws.
+
+Find references and rename cover types, constructors, defs, and laws. Uses come
+from the compiler's own name resolution, so a parameter or other local that
+shadows a top-level name is never touched, and a rename keeps each file's import
+alias (`Dep.answer` becomes `Dep.reply`). They need the files to parse, and
+work while the file still has type errors. Both search the analyzed files, the
+open files, and the workspace files that import the declaring file; files that
+do not parse are skipped. Put the cursor on the name itself, not on its alias.
+Names from Base and hub packages cannot be renamed. Sugar is not a use: a
+`do M<..>:` block calls `M.bind` and `M.pure` without spelling them, so it is
+not listed for them, and its header does not follow a rename of `M`.
 
 Analysis uses the bundled Bend compiler and Base library in a worker thread.
 Relative imports resolve from the document, then from open overlays. Hub

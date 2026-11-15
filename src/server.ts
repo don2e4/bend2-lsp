@@ -1,17 +1,17 @@
 #!/usr/bin/env node
-import { existsSync, watchFile, unwatchFile } from "node:fs";
-import { isAbsolute, relative, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { existsSync, readdirSync, readFileSync, watchFile, unwatchFile } from "node:fs";
+import { isAbsolute, join, relative, sep } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
-  CompletionItemKind, createConnection, DiagnosticSeverity, FoldingRangeKind, MarkupKind, ProposedFeatures, SymbolKind, TextDocuments, TextDocumentSyncKind,
-  type CompletionItem, type Diagnostic, type DocumentSymbol, type FoldingRange, type Hover, type InitializeResult, type Location, type TextEdit,
+  CompletionItemKind, createConnection, DiagnosticSeverity, FoldingRangeKind, LSPErrorCodes, MarkupKind, ProposedFeatures, ResponseError, SymbolKind, TextDocuments, TextDocumentSyncKind,
+  type CompletionItem, type Diagnostic, type DocumentSymbol, type FoldingRange, type Hover, type InitializeResult, type Location, type Position, type Range, type TextEdit, type WorkspaceEdit,
 } from "vscode-languageserver/node";
 import { TextDocument } from "vscode-languageserver-textdocument";
 import { Analyzer } from "./analysis.js";
 import { formatBend } from "./formatter.js";
 import { hubImport, KEYWORDS, lexicalDiagnostics, staticHover } from "./lexical.js";
 import { declarations, foldingRanges } from "./outline.js";
-import type { AnalysisDiagnostic, AnalysisResult, CompletionEntry, Overlay } from "./protocol.js";
+import type { AnalysisDiagnostic, AnalysisResult, CompletionEntry, Overlay, Reference } from "./protocol.js";
 
 const VERSION = "0.2.0";
 const connection = createConnection(ProposedFeatures.all);
@@ -158,17 +158,20 @@ function invalidate(uris: Set<string>): void {
   for (const uri of affected) publish(uri);
 }
 
+function request(document: TextDocument, path: string): Promise<AnalysisResult> {
+  return analyzer.analyze({ type: "analyze", uri: document.uri, path, version: document.version, text: document.getText(), overlays: overlays(), workspaceRoot: workspaceRoot(path), proofEntrypoint });
+}
+
 async function analyze(uri: string): Promise<void> {
   const document = documents.get(uri);
   if (!document || !supported(document)) return;
-  const version = document.version;
   const path = filePath(uri);
   if (!path) {
     publish(uri);
     return;
   }
   const started = generation;
-  const result = await analyzer.analyze({ type: "analyze", uri, path, version, text: document.getText(), overlays: overlays(), workspaceRoot: workspaceRoot(path), proofEntrypoint });
+  const result = await request(document, path);
   const current = documents.get(uri);
   if (!current) return;
   if (started !== generation || current.version !== result.version || !fresh(result)) { schedule(uri); return; }
@@ -200,6 +203,7 @@ connection.onInitialize((params): InitializeResult => {
     capabilities: {
       textDocumentSync: TextDocumentSyncKind.Full, documentFormattingProvider: true, hoverProvider: true, definitionProvider: true,
       completionProvider: { triggerCharacters: ["."] }, documentSymbolProvider: true, foldingRangeProvider: true,
+      referencesProvider: true, renameProvider: params.capabilities.textDocument?.rename?.prepareSupport ? { prepareProvider: true } : true,
     },
     serverInfo: { name: "bend2-lsp", version: VERSION },
   };
@@ -335,6 +339,104 @@ connection.onFoldingRanges((params): FoldingRange[] => {
     startLine: fold.startLine, endLine: fold.endLine,
     ...(fold.kind ? { kind: fold.kind === "comment" ? FoldingRangeKind.Comment : FoldingRangeKind.Imports } : {}),
   }));
+});
+
+type Found = { result: AnalysisResult; group: Reference; location: Location };
+
+// The name under the cursor, which may sit at either end of it.
+function referenceAt(uri: string, position: Position): Found | undefined {
+  const result = results.get(uri);
+  if (!result || !fresh(result)) return undefined;
+  for (const group of result.references) {
+    for (const location of [...group.declarations, ...group.uses]) {
+      const { start, end } = location.range;
+      if (location.uri === uri && start.line === position.line && start.character <= position.character && position.character <= end.character) return { result, group, location };
+    }
+  }
+  return undefined;
+}
+
+// shortcut: a synchronous walk of at most 10000 directories, enough for a project; index workspace files if roots outgrow it.
+function bendFiles(root: string): string[] {
+  const found: string[] = [];
+  const todo = [root];
+  for (let visited = 0; todo.length > 0 && visited < 10_000; visited++) {
+    const directory = todo.pop()!;
+    let entries;
+    try { entries = readdirSync(directory, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+      if (entry.isDirectory()) todo.push(join(directory, entry.name));
+      else if (entry.name.endsWith(".bend")) found.push(join(directory, entry.name));
+    }
+  }
+  return found;
+}
+
+// A file can name a declaration only by importing its file, so the workspace
+// files that do are analyzed now, unless an open document's analysis is current.
+function importers(group: Reference): Promise<AnalysisResult[]> {
+  const homes = new Set(group.declarations.map((item) => filePath(item.uri)));
+  const open = new Map(documents.all().map((document) => [filePath(document.uri), document]));
+  const pending: Promise<AnalysisResult>[] = [];
+  for (const file of new Set(workspaceRoots.flatMap(bendFiles))) {
+    let document = open.get(file);
+    try { document ??= TextDocument.create(pathToFileURL(file).href, "bend", 0, readFileSync(file, "utf8")); } catch { continue; }
+    const known = results.get(document.uri);
+    if (known && fresh(known)) continue;
+    if ([...importUris(document)].some((uri) => homes.has(filePath(uri)))) pending.push(request(document, file));
+  }
+  return Promise.all(pending);
+}
+
+// One name across every analysis that declares it at the same place: each
+// open file is checked in its own context, so no single analysis sees all uses.
+async function gather(uri: string, position: Position): Promise<Reference | undefined> {
+  const seed = referenceAt(uri, position);
+  if (!seed) return undefined;
+  const extra = seed.group.renameable ? await importers(seed.group) : [];
+  // The wait may have outlived an edit, and stale positions would misplace a rename.
+  if (!fresh(seed.result)) return undefined;
+  const id = (item: Location) => `${item.uri}#${item.range.start.line}:${item.range.start.character}`;
+  const same = new Set(seed.group.declarations.map(id));
+  const declarations = new Map<string, Location>();
+  const uses = new Map<string, Location>();
+  let renameable = seed.group.renameable;
+  for (const result of new Set([seed.result, ...results.values(), ...extra])) {
+    if (!fresh(result)) continue;
+    for (const group of result.references) {
+      if (group !== seed.group && !group.declarations.some((item) => same.has(id(item)))) continue;
+      renameable &&= group.renameable;
+      for (const item of group.declarations) declarations.set(id(item), item);
+      for (const item of group.uses) uses.set(id(item), item);
+    }
+  }
+  for (const key of declarations.keys()) uses.delete(key);
+  return { declarations: [...declarations.values()], uses: [...uses.values()], renameable };
+}
+
+const NOT_RENAMEABLE = "Names from Base and hub packages cannot be renamed.";
+
+connection.onReferences(async (params): Promise<Location[]> => {
+  const group = await gather(params.textDocument.uri, params.position);
+  return group ? [...(params.context.includeDeclaration ? group.declarations : []), ...group.uses] : [];
+});
+
+connection.onPrepareRename((params): { range: Range; placeholder: string } | null => {
+  const found = referenceAt(params.textDocument.uri, params.position);
+  if (!found) return null;
+  if (!found.group.renameable) throw new ResponseError(LSPErrorCodes.RequestFailed, NOT_RENAMEABLE);
+  return { range: found.location.range, placeholder: documents.get(params.textDocument.uri)!.getText(found.location.range) };
+});
+
+connection.onRenameRequest(async (params): Promise<WorkspaceEdit | null> => {
+  if (!/^[A-Za-z_][A-Za-z0-9_.]*$/.test(params.newName) || KEYWORDS.includes(params.newName)) throw new ResponseError(LSPErrorCodes.RequestFailed, `'${params.newName}' is not a Bend name.`);
+  const group = await gather(params.textDocument.uri, params.position);
+  if (!group) return null;
+  if (!group.renameable) throw new ResponseError(LSPErrorCodes.RequestFailed, NOT_RENAMEABLE);
+  const changes: Record<string, TextEdit[]> = {};
+  for (const item of [...group.declarations, ...group.uses]) (changes[item.uri] ??= []).push({ range: item.range, newText: params.newName });
+  return { changes };
 });
 
 documents.onDidOpen(({ document }) => {

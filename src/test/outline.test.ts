@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { declarations, foldingRanges } from "../outline.js";
+import { codeOnly, declarations, foldingRanges } from "../outline.js";
 
 const source = [
   "import Base",
@@ -69,4 +69,12 @@ test("keeps CRLF offsets and ignores declarations inside comments and strings", 
   assert.equal(rest.length, 0);
   assert.equal(crlf.slice(only.start, only.end), "yes");
   assert.equal(only.doc, "def nope():");
+});
+
+test("blanks comments and literals without moving offsets", () => {
+  const source = 'x = Box{1} # Box{\r\ny = "Box{\\"" \'{\' Box{2}\n';
+  const code = codeOnly(source);
+  assert.equal(code.length, source.length);
+  assert.deepEqual([...code.matchAll(/Box\{/g)].map((match) => match.index), [source.indexOf("Box{"), source.lastIndexOf("Box{")]);
+  assert.deepEqual([...code.matchAll(/\n/g)].map((match) => match.index), [...source.matchAll(/\n/g)].map((match) => match.index));
 });

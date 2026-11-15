@@ -164,6 +164,8 @@ test("serves formatting over an LSP stdio session", async (context) => {
     completionProvider: { triggerCharacters: ["."] },
     documentSymbolProvider: true,
     foldingRangeProvider: true,
+    referencesProvider: true,
+    renameProvider: true,
   });
 
   send(child, { jsonrpc: "2.0", method: "initialized", params: {} });
@@ -327,5 +329,81 @@ test("completes, outlines and folds over an LSP session", async (context) => {
   assert.ok(folds.some((fold) => fold.startLine === 6 && fold.endLine === 9));
 
   await call("shutdown", {});
+  send(child, { jsonrpc: "2.0", method: "exit" });
+});
+
+test("finds references and renames across open and closed files", async (context) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bend2-rename-session-"));
+  const texts: Record<string, string> = {
+    "dep.bend": "import Base\n\ndef answer() -> U32:\n  42\n\ndef twice() -> U32:\n  (answer + answer : U32)\n",
+    "main.bend": "import Base\nimport ./dep.bend as Dep\n\ndef shadow(answer: U32) -> U32:\n  (answer + Dep.answer : U32)\n",
+    // Never opened: only a walk of the workspace finds it.
+    "closed.bend": "import Base\nimport ./dep.bend as D\n\ndef main() -> String:\n  U32.show(D.answer)\n",
+    "unrelated.bend": "import Base\n\ndef answer() -> U32:\n  0\n",
+  };
+  const uri = (name: string) => pathToFileURL(path.join(dir, name)).href;
+  for (const [name, text] of Object.entries(texts)) fs.writeFileSync(path.join(dir, name), text);
+  const server = process.env.BEND2_LSP_SERVER ?? fileURLToPath(new URL("../server.js", import.meta.url));
+  const child = spawn(process.execPath, [server, "--stdio"], { stdio: ["pipe", "pipe", "pipe"] });
+  context.after(() => { child.kill(); fs.rmSync(dir, { recursive: true, force: true }); });
+  const waitFor = responses(child);
+  let id = 1;
+  const ask = (method: string, params: object) => {
+    const reply = waitFor(id);
+    send(child, { jsonrpc: "2.0", id: id++, method, params });
+    return reply;
+  };
+  const at = (name: string, text: string, offset = 0) => {
+    const lines = texts[name].slice(0, texts[name].indexOf(text) + offset).split("\n");
+    return { textDocument: { uri: uri(name) }, position: { line: lines.length - 1, character: lines.at(-1)!.length } };
+  };
+
+  const initialize = await ask("initialize", { rootUri: pathToFileURL(dir).href, capabilities: { textDocument: { rename: { prepareSupport: true } } } });
+  assert.deepEqual((initialize.result as { capabilities: { renameProvider: unknown } }).capabilities.renameProvider, { prepareProvider: true });
+  send(child, { jsonrpc: "2.0", method: "initialized", params: {} });
+  for (const name of ["dep.bend", "main.bend"]) send(child, { jsonrpc: "2.0", method: "textDocument/didOpen", params: { textDocument: { uri: uri(name), languageId: "bend", version: 1, text: texts[name] } } });
+  let prepared: unknown = null;
+  for (let tries = 0; tries < 80 && !prepared; tries++) {
+    prepared = (await ask("textDocument/prepareRename", at("dep.bend", "answer", 2))).result;
+    if (!prepared) await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.deepEqual(prepared, { range: { start: { line: 2, character: 4 }, end: { line: 2, character: 10 } }, placeholder: "answer" });
+
+  type Place = { uri: string; range: { start: { line: number; character: number }; end: { line: number; character: number } } };
+  const places = (items: Place[]) => items.map((item) => `${path.basename(fileURLToPath(item.uri))}:${item.range.start.line}:${item.range.start.character}`).sort();
+  const everywhere = ["closed.bend:4:13", "dep.bend:2:4", "dep.bend:6:12", "dep.bend:6:3", "main.bend:4:16"];
+  const references = async (declaration: boolean) => places((await ask("textDocument/references", { ...at("dep.bend", "answer"), context: { includeDeclaration: declaration } })).result as Place[]);
+  assert.deepEqual(await references(true), everywhere);
+  assert.deepEqual(await references(false), everywhere.filter((place) => place !== "dep.bend:2:4"));
+  // The parameter named like the def is a different name.
+  assert.equal((await ask("textDocument/prepareRename", at("main.bend", "(answer", 1))).result, null);
+
+  // From a use behind an alias, the alias stays and every file follows.
+  const renamed = await ask("textDocument/rename", { ...at("main.bend", "Dep.answer", 6), newName: "reply" });
+  assert.equal(renamed.error, undefined);
+  const changes = (renamed.result as { changes: Record<string, Array<Place & { newText: string }>> }).changes;
+  const apply = (name: string) => {
+    const lines = texts[name].split("\n");
+    for (const edit of [...changes[uri(name)] ?? []].sort((a, b) => b.range.start.line - a.range.start.line || b.range.start.character - a.range.start.character)) {
+      const line = lines[edit.range.start.line];
+      lines[edit.range.start.line] = line.slice(0, edit.range.start.character) + edit.newText + line.slice(edit.range.end.character);
+    }
+    return lines.join("\n");
+  };
+  assert.deepEqual(Object.keys(changes).sort(), ["closed.bend", "dep.bend", "main.bend"].map(uri));
+  assert.equal(apply("dep.bend"), "import Base\n\ndef reply() -> U32:\n  42\n\ndef twice() -> U32:\n  (reply + reply : U32)\n");
+  assert.equal(apply("main.bend"), "import Base\nimport ./dep.bend as Dep\n\ndef shadow(answer: U32) -> U32:\n  (answer + Dep.reply : U32)\n");
+  assert.equal(apply("closed.bend"), "import Base\nimport ./dep.bend as D\n\ndef main() -> String:\n  U32.show(D.reply)\n");
+
+  const keyword = await ask("textDocument/rename", { ...at("dep.bend", "answer"), newName: "match" });
+  assert.match(JSON.stringify(keyword.error), /not a Bend name/);
+  const base = await ask("textDocument/rename", { ...at("main.bend", "U32", 1), newName: "Word" });
+  assert.match(JSON.stringify(base.error), /cannot be renamed/);
+
+  // An edit makes the analysis stale: no rename until the file is checked again.
+  send(child, { jsonrpc: "2.0", method: "textDocument/didChange", params: { textDocument: { uri: uri("dep.bend"), version: 2 }, contentChanges: [{ text: "\n" + texts["dep.bend"] }] } });
+  assert.equal((await ask("textDocument/rename", { ...at("dep.bend", "answer"), newName: "reply" })).result, null);
+
+  assert.equal((await ask("shutdown", {})).result, null);
   send(child, { jsonrpc: "2.0", method: "exit" });
 });

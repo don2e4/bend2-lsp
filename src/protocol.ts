@@ -11,6 +11,10 @@ export type AnalysisDiagnostic = {
 
 export type CompletionEntry = { label: string; kind: "def" | "law" | "type" | "constructor"; detail: string; documentation?: string };
 
+// One top-level name: where it is declared and used. Ranges cover the name
+// without an import alias, so a rename rewrites each the same way.
+export type Reference = { declarations: Location[]; uses: Location[]; renameable: boolean };
+
 // Hovers and definitions are keyed by a name as the analyzed file spells it.
 // A constructor that shares its type's name is also keyed as `Name{}`.
 export type AnalysisResult = {
@@ -25,6 +29,8 @@ export type AnalysisResult = {
   hovers: Record<string, string>;
   definitions: Record<string, Location>;
   completions: CompletionEntry[];
+  // Empty when the files did not parse, so a rename never works from part of them.
+  references: Reference[];
 };
 
 export type Overlay = { uri: string; path: string; version: number; text: string };

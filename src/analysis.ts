@@ -70,7 +70,7 @@ export class Analyzer {
         uri: oldest.input.uri, range: { start: 0, end: 0 }, code: "checking",
         message: `Checking stopped after ${seconds} s without an answer. It may be evaluating a def that never returns, such as an @unsafe one.`,
       }],
-      hovers: {}, definitions: {}, completions: [],
+      hovers: {}, definitions: {}, completions: [], references: [],
     });
   }
 

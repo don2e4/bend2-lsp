@@ -15,10 +15,11 @@ import {
   type Book,
   type Err,
   type File,
+  type Span,
 } from "../vendor/bend2/bend.js";
 import { hubImport, lexicalDiagnostics } from "./lexical.js";
-import { declarations, type Declaration } from "./outline.js";
-import type { AnalysisDiagnostic, AnalysisRequest, AnalysisResult, CompletionEntry, Location, Overlay } from "./protocol.js";
+import { codeOnly, declarations, type Declaration } from "./outline.js";
+import type { AnalysisDiagnostic, AnalysisRequest, AnalysisResult, CompletionEntry, Location, Overlay, Reference } from "./protocol.js";
 
 type Source = { original: string; staged: string; uri: string; text: string; namespace: string; aliases: Map<string, string>; version?: number };
 type Declared = Declaration & { key: string; source: Source };
@@ -186,13 +187,26 @@ function originalOffset(source: Source, spanSource: string, offset: number): num
   return result + column;
 }
 
-function position(text: string, offset: number): Location["range"]["start"] {
-  const lines = text.slice(0, offset).split("\n");
-  return { line: lines.length - 1, character: lines.at(-1)!.length };
+// Line starts are kept per source: its references ask for many positions.
+const lineStarts = new WeakMap<Source, number[]>();
+function position(source: Source, offset: number): Location["range"]["start"] {
+  let starts = lineStarts.get(source);
+  if (!starts) {
+    starts = [0];
+    for (let at = source.text.indexOf("\n"); at >= 0; at = source.text.indexOf("\n", at + 1)) starts.push(at + 1);
+    lineStarts.set(source, starts);
+  }
+  let line = 0;
+  for (let high = starts.length - 1; line < high;) {
+    const middle = (line + high + 1) >> 1;
+    if (starts[middle] <= offset) line = middle;
+    else high = middle - 1;
+  }
+  return { line, character: offset - starts[line] };
 }
 
-function location(item: Declared): Location {
-  return { uri: item.source.uri, range: { start: position(item.source.text, item.start), end: position(item.source.text, item.end) } };
+function location(item: Declared, start = item.start): Location {
+  return { uri: item.source.uri, range: { start: position(item.source, start), end: position(item.source, item.end) } };
 }
 
 // A declared name's book key: `ns:name`, through an alias when it fills an
@@ -270,6 +284,81 @@ function describe(book: Book, file: File, declared: Declared[]): Pick<AnalysisRe
     completions.push({ label: shown, kind: "constructor", detail: signature, documentation: declaration?.doc || undefined });
   }
   return { hovers, definitions, completions };
+}
+
+// Where every top-level name is declared and used. Uses come from the parsed
+// book, where the compiler has already told a name from a local that shadows
+// it. It keeps no span for a constructor in a pattern, so constructors, always
+// written `Name{`, are read from the text. Call before book_valid, which
+// empties the bodies it has not reached.
+function references(book: Book, sources: Source[], declared: Declared[]): Reference[] {
+  const leaf = (name: string) => name.slice(name.indexOf(":") + 1);
+  const uses = new Map<string, Map<string, Location>>();
+  const use = (id: string, source: Source, end: number) => {
+    const start = position(source, end - leaf(id.replace(/\{\}$/, "")).length);
+    let found = uses.get(id);
+    if (!found) uses.set(id, found = new Map());
+    found.set(`${source.uri}#${start.line}:${start.character}`, { uri: source.uri, range: { start, end: position(source, end) } });
+  };
+  // A span counts from the text the compiler read, whose import lines are blank.
+  const origins = new Map<File, { source: Source; shift: number } | undefined>();
+  const origin = (file: File) => {
+    if (!origins.has(file)) {
+      const source = sourceForSpan(sources, file);
+      origins.set(file, source && { source, shift: source.text.length - file.str.length });
+    }
+    return origins.get(file);
+  };
+  const name = /(\+\s*)?([A-Za-z_][A-Za-z0-9_.]*)/y;
+  const seen = new Set<object>();
+  const walk = (term: object) => {
+    for (const todo = [term]; todo.length > 0;) {
+      const node = todo.pop() as Record<string, unknown> & { s?: Span };
+      if (seen.has(node)) continue;
+      seen.add(node);
+      const from = (node.$ === "Ref" || node.$ === "ADT") && typeof node.k === "string" && node.s ? origin(node.s.file) : undefined;
+      if (from) {
+        // Sugar such as `a + b` or a `do` block refers to names it does not
+        // spell: only a spelled name is a use. `+D<..>` spans its plus, and
+        // `Name{` is a constructor even where sugar gives a type its span.
+        name.lastIndex = node.s!.beg + from.shift;
+        const match = name.exec(from.source.text);
+        const spelled = match && (match[1] === undefined || node.$ === "ADT") && from.source.text[name.lastIndex] !== "{" ? match[2] : undefined;
+        if (spelled !== undefined && (keyOf(from.source, spelled) === node.k || spelled === node.k)) use(node.k as string, from.source, name.lastIndex);
+      }
+      for (const field in node) {
+        const value = node[field];
+        if (field !== "s" && typeof value === "object" && value !== null) todo.push(value);
+      }
+    }
+  };
+  for (const tld of Object.values(book.tlds)) {
+    if (tld.b === true) continue;
+    // A literal too large to expand overflows the stack, as it does in the checker.
+    try {
+      for (const item of tld.$ === "ADT" ? [tld, ...tld.c] : [tld]) walk(term_lower(item.T));
+      if (tld.$ === "Def" && tld.v !== null) walk(term_lower(tld.v));
+    } catch { /* That def's uses are left out. */ }
+  }
+  for (const source of sources) {
+    for (const match of codeOnly(source.text).matchAll(/(?<![A-Za-z0-9_.])([A-Za-z_][A-Za-z0-9_.]*)\{/g)) {
+      const own = keyOf(source, match[1]);
+      const key = own in book.ctrs ? own : match[1] in book.ctrs ? match[1] : undefined;
+      if (key !== undefined) use(`${key}{}`, source, match.index + match[1].length);
+    }
+  }
+  const declarations = new Map<string, Declared[]>();
+  for (const item of declared) {
+    const id = item.kind === "constructor" ? `${item.key}{}` : item.key;
+    if (item.source.original !== BASE_BEND && !uses.has(id)) uses.set(id, new Map());
+    declarations.set(id, [...declarations.get(id) ?? [], item]);
+  }
+  return [...uses].map(([id, found]) => {
+    const items = declarations.get(id) ?? [];
+    const places = items.map((item) => location(item, item.end - leaf(item.key).length));
+    for (const place of places) found.delete(`${place.uri}#${place.range.start.line}:${place.range.start.character}`);
+    return { declarations: places, uses: [...found.values()], renameable: items.length > 0 && items.every((item) => item.source.original !== BASE_BEND) };
+  });
 }
 
 function markers(book: Book, sources: Source[], declared: Declared[]): AnalysisDiagnostic[] {
@@ -413,7 +502,7 @@ async function describeBase(request: AnalysisRequest): Promise<AnalysisResult> {
   const book = book_nil();
   await book_load(book, BASE_BEND, "", new Map());
   const file: File = { str: "", ns: "", al: Object.create(null) as Record<string, string> };
-  return { id: request.id, uri: request.uri, version: request.version, versions: { [request.uri]: request.version }, diagnostics: [], ...describe(book, file, baseDeclarations()) };
+  return { id: request.id, uri: request.uri, version: request.version, versions: { [request.uri]: request.version }, diagnostics: [], ...describe(book, file, baseDeclarations()), references: [] };
 }
 
 async function analyze(request: AnalysisRequest): Promise<AnalysisResult> {
@@ -429,10 +518,12 @@ async function analyze(request: AnalysisRequest): Promise<AnalysisResult> {
     const declared = [...declare(staged.sources), ...baseDeclarations()];
     const book = book_nil();
     let checking = false;
+    let found: Reference[] = [];
     const diagnostics: AnalysisDiagnostic[] = [];
     try {
       await book_load(book, compilerPath(staged.entry), "", new Map());
       checking = true;
+      found = references(book, staged.sources, declared);
       // book_load returns the number of imported declarations, not the number
       // already checked. Skipping them misses unfilled laws and invalid proofs
       // in imports. Like the CLI without a prechecked Base, check the full book.
@@ -469,7 +560,7 @@ async function analyze(request: AnalysisRequest): Promise<AnalysisResult> {
     const versions = Object.fromEntries(staged.sources.flatMap((source) => source.version === undefined ? [] : [[source.uri, source.version]]));
     // Discovery reads overlays too, including an entry whose import was removed.
     for (const overlay of request.overlays) if (context.dependencies.has(overlay.uri)) versions[overlay.uri] = overlay.version;
-    return { id: request.id, uri: request.uri, version: request.version, versions, dependencies: [...context.dependencies], entrypoint: root.uri, diagnostics, ...describe(book, file, declared) };
+    return { id: request.id, uri: request.uri, version: request.version, versions, dependencies: [...context.dependencies], entrypoint: root.uri, diagnostics, ...describe(book, file, declared), references: found };
   } finally {
     fs.rmSync(runRoot, { recursive: true, force: true });
   }
@@ -481,7 +572,7 @@ parentPort?.on("message", (request: AnalysisRequest) => {
   void analyze(request).catch((caught): AnalysisResult => ({
     id: request.id, uri: request.uri, version: request.version, versions: { [request.uri]: request.version },
     diagnostics: [{ uri: request.uri, range: { start: 0, end: 0 }, message: `Analysis failed: ${caught instanceof Error ? caught.message : String(caught)}`, code: "imports" }],
-    hovers: {}, definitions: {}, completions: [],
+    hovers: {}, definitions: {}, completions: [], references: [],
   })).then((result) => parentPort?.postMessage(result));
 });
 
